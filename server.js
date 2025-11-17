@@ -1,3 +1,4 @@
+// server.js (ready-to-paste)
 import express from "express";
 import mongoose from "mongoose";
 import nodemailer from "nodemailer";
@@ -12,45 +13,82 @@ dotenv.config();
 
 const app = express();
 
-/* -----------------------------------------------------
-   🔥 CORS + LOGGER (FIXES ALL YOUR FRONTEND ERRORS)
------------------------------------------------------- */
+/* -------------------------
+   Simple request logger
+--------------------------*/
 app.use((req, res, next) => {
-  console.log(new Date().toISOString(), req.method, req.path);
+  console.log(new Date().toISOString(), req.method, req.originalUrl, "from", req.headers.origin || "no-origin");
   next();
 });
 
-const allowedOrigins = [
-  "http://localhost:3000",           // local dev
-  "https://cosco-shipment.netlify.app",  // your netlify frontend (replace if needed)
+/* -------------------------
+   CORS config (dev + prod)
+   Allow:
+     - localhost frontends
+     - 127.0.0.1 frontends (you used 3001)
+     - your Netlify production URL(s)
+--------------------------*/
+const FRONTEND_ORIGINS = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3001",                  // your local/register origin you used in screenshots
+  "http://127.0.0.1:5500",                  // if you open HTML file via live server
+  "https://coscoships-login.netlify.app",   // your Netlify (example from screenshots)
+  "https://cosco-ships.netlify.app",        // another Netlify variant you mentioned
+  "https://cosco-backend.onrender.com"      // allow backend origin for safe internal calls (optional)
 ];
 
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin) return callback(null, true); // allow tools like Postman
-      if (allowedOrigins.includes(origin)) callback(null, true);
-      else callback(new Error("CORS not allowed by server"));
+      // allow requests with no origin (curl, Postman, or file:// cases)
+      if (!origin) return callback(null, true);
+      if (FRONTEND_ORIGINS.includes(origin)) return callback(null, true);
+      console.warn("CORS blocked for origin:", origin);
+      return callback(new Error("CORS not allowed by server"));
     },
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-requested-with"],
     credentials: true,
+    preflightContinue: false,
+    optionsSuccessStatus: 204,
   })
 );
-app.options("*", cors());
+app.options("*", cors()); // enable pre-flight for all routes
 
+/* -------------------------
+   Body parsers
+--------------------------*/
 app.use(express.json());
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
 
-/* -----------------------------------------------------
-   🔥 CONNECT MONGODB
------------------------------------------------------- */
+/* -------------------------
+   Env checks (helpful)
+--------------------------*/
+if (!process.env.MONGO_URI) {
+  console.warn("⚠️  MONGO_URI NOT SET. Set MONGO_URI in .env or Render Environment variables.");
+}
+if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+  console.warn("⚠️  EMAIL_USER / EMAIL_PASS not set - OTP emails will fail without these.");
+}
+if (!process.env.RZP_KEY_SECRET) {
+  console.warn("⚠️  RZP_KEY_SECRET not set - Razorpay verification will fail without it.");
+}
+
+/* -------------------------
+   Connect MongoDB
+--------------------------*/
 mongoose
-  .connect(process.env.MONGO_URI)
+  .connect(process.env.MONGO_URI || "", {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  })
   .then(() => console.log("✅ MongoDB Connected to Atlas"))
-  .catch((err) => console.log("❌ Mongo Error:", err.message));
+  .catch((err) => console.log("❌ Mongo Error:", err?.message || err));
 
-/* -----------------------------------------------------
-   🔥 GMAIL SMTP TRANSPORTER
------------------------------------------------------- */
+/* -------------------------
+   Nodemailer transporter (Gmail)
+--------------------------*/
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
@@ -59,21 +97,20 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-/* -----------------------------------------------------
-   🔥 SEND OTP
------------------------------------------------------- */
+/* -------------------------
+   SEND OTP
+--------------------------*/
 app.post("/send-otp", async (req, res) => {
   try {
     const { name, phone, email } = req.body;
 
     if (!name || !email) {
-      return res.json({ success: false, message: "Missing fields" });
+      return res.status(400).json({ success: false, message: "Missing fields" });
     }
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
     let user = await User.findOne({ email });
-
     if (!user) {
       user = new User({ name, phone, email, otp });
     } else {
@@ -82,54 +119,55 @@ app.post("/send-otp", async (req, res) => {
 
     await user.save();
 
-    await transporter.sendMail({
-      from: `"COSCO Shipping" <${process.env.EMAIL_USER}>`,
-      to: email,
-      subject: "Your COSCO OTP Code",
-      text: `Hello ${name}, your OTP is ${otp}.`,
-    });
+    // send email (catch SMTP errors)
+    try {
+      await transporter.sendMail({
+        from: `"COSCO Shipping" <${process.env.EMAIL_USER}>`,
+        to: email,
+        subject: "Your COSCO OTP Code",
+        text: `Hello ${name}, your OTP is ${otp}.`,
+      });
+    } catch (mailErr) {
+      console.error("Mail send error:", mailErr);
+      return res.status(500).json({ success: false, message: "Failed to send OTP email", error: mailErr.message });
+    }
 
-    res.json({ success: true, message: "OTP sent successfully!" });
+    return res.json({ success: true, message: "OTP sent successfully!" });
   } catch (error) {
-    console.log("SEND OTP ERROR:", error);
-    res.json({ success: false, message: "OTP send failed" });
+    console.error("SEND OTP ERROR:", error);
+    return res.status(500).json({ success: false, message: "OTP send failed", error: error?.message });
   }
 });
 
-/* -----------------------------------------------------
-   🔥 VERIFY OTP
------------------------------------------------------- */
+/* -------------------------
+   VERIFY OTP
+--------------------------*/
 app.post("/verify-otp", async (req, res) => {
   try {
     const { email, otp } = req.body;
+    if (!email || !otp) return res.status(400).json({ success: false, message: "Missing fields" });
 
     const user = await User.findOne({ email });
-
-    if (!user || user.otp !== otp) {
-      return res.json({ success: false, message: "Invalid OTP" });
-    }
+    if (!user || user.otp !== otp) return res.status(400).json({ success: false, message: "Invalid OTP" });
 
     user.verified = true;
     user.otp = null;
     await user.save();
 
-    res.json({ success: true, message: "User verified", user });
+    return res.json({ success: true, message: "User verified", user });
   } catch (error) {
-    console.log("VERIFY ERROR:", error);
-    res.json({ success: false, message: "Verification failed" });
+    console.error("VERIFY ERROR:", error);
+    return res.status(500).json({ success: false, message: "Verification failed", error: error?.message });
   }
 });
 
-/* -----------------------------------------------------
-   🔥 RAZORPAY ORDER CREATE
------------------------------------------------------- */
+/* -------------------------
+   CREATE ORDER (Razorpay)
+--------------------------*/
 app.post("/create-order", async (req, res) => {
   try {
     const { amount } = req.body;
-
-    if (!amount || amount <= 0) {
-      return res.json({ success: false, message: "Invalid amount" });
-    }
+    if (!amount || Number(amount) <= 0) return res.status(400).json({ success: false, message: "Invalid amount" });
 
     const options = {
       amount: Number(amount) * 100,
@@ -138,69 +176,62 @@ app.post("/create-order", async (req, res) => {
     };
 
     const order = await razorpay.orders.create(options);
-
-    res.json({ success: true, order });
+    return res.json({ success: true, order });
   } catch (error) {
-    console.log("ORDER ERROR:", error);
-    res.json({ success: false, message: "Order creation failed" });
+    console.error("ORDER ERROR:", error);
+    return res.status(500).json({ success: false, message: "Order creation failed", error: error?.message });
   }
 });
 
-/* -----------------------------------------------------
-   🔥 RAZORPAY PAYMENT VERIFY
------------------------------------------------------- */
+/* -------------------------
+   VERIFY PAYMENT (Razorpay signature)
+--------------------------*/
 app.post("/verify-payment", async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
-      req.body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature)
+      return res.status(400).json({ success: false, message: "Missing fields" });
 
     const sign = razorpay_order_id + "|" + razorpay_payment_id;
-
-    const expectedSign = crypto
-      .createHmac("sha256", process.env.RZP_KEY_SECRET)
-      .update(sign)
-      .digest("hex");
+    const expectedSign = crypto.createHmac("sha256", process.env.RZP_KEY_SECRET || "").update(sign).digest("hex");
 
     if (expectedSign === razorpay_signature) {
       return res.json({ success: true, message: "Payment Verified!" });
     }
 
-    res.json({ success: false, message: "Invalid signature!" });
+    return res.status(400).json({ success: false, message: "Invalid signature!" });
   } catch (error) {
-    console.log("VERIFY ERROR:", error);
-    res.json({ success: false, message: "Verification failed" });
+    console.error("VERIFY ERROR:", error);
+    return res.status(500).json({ success: false, message: "Verification failed", error: error?.message });
   }
 });
 
-/* -----------------------------------------------------
-   🔥 GET USER DETAILS
------------------------------------------------------- */
+/* -------------------------
+   GET USER BY EMAIL
+--------------------------*/
 app.get("/user/:email", async (req, res) => {
   try {
     const email = req.params.email;
     const user = await User.findOne({ email });
-
-    if (!user) {
-      return res.json({ success: false, message: "User not found" });
-    }
-
-    res.json({ success: true, user });
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+    return res.json({ success: true, user });
   } catch (error) {
-    console.log("USER ERROR:", error);
-    res.json({ success: false, message: "Error retrieving user" });
+    console.error("USER ERROR:", error);
+    return res.status(500).json({ success: false, message: "Error retrieving user", error: error?.message });
   }
 });
 
-/* -----------------------------------------------------
-   🔥 HOME ROUTE
------------------------------------------------------- */
+/* -------------------------
+   Root - returns JSON (safer than HTML)
+--------------------------*/
 app.get("/", (req, res) => {
-  res.send("🚀 COSCO Backend Active");
+  res.json({ success: true, message: "🚀 COSCO Backend Active" });
 });
 
-/* -----------------------------------------------------
-   🔥 START SERVER
------------------------------------------------------- */
-app.listen(process.env.PORT || 5000, () => {
-  console.log(`🚀 Server running at ${process.env.PORT || 5000}`);
+/* -------------------------
+   Start server (works on Render)
+--------------------------*/
+const PORT = Number(process.env.PORT) || 5000;
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
